@@ -130,7 +130,7 @@
 
     <!-- Notifications section -->
     <div id="notifSection" style="margin: 20px 0;">
-        <button id="enableNotifBtn" onclick="enableNotifications()"
+        <button id="enableNotifBtn" onclick="subscribeAndSendToken()"
             style="padding: 12px 24px; font-size: 1em; font-weight: bold; cursor: pointer; border: none; border-radius: 6px; background:#ffcc00; color: #000;">
             تفعيل التنبيهات 🔔
         </button>
@@ -202,7 +202,7 @@
 
         // عنوان Cloudflare Worker الخاص بك لحفظ الـ Token
         // بعد نشر الـ Worker ضع رابطك الحقيقي مكان REPLACE
-        const TOKEN_ENDPOINT = 'https://cash-mobile-fcm.cash-mobile-fcm.eng-ali-m-ibrahim.workers.dev.workers.dev/register';
+        const TOKEN_ENDPOINT = 'https://cash-mobile-fcm.eng-ali-m-ibrahim.workers.dev/register';
 
         firebase.initializeApp(firebaseConfig);
         const messaging = firebase.messaging();
@@ -225,8 +225,66 @@
             return /FBAN|FBAV|Instagram|Telegram|WhatsApp|Line|Messenger/i.test(navigator.userAgent);
         }
 
-        async function enableNotifications() {
-            // تسجيل الـ Service Worker دائماً (مطلوب لاستقبال الإشعارات حتى عند إغلاق الموقع)
+        // ---------- الاشتراك الفعلي (طلب الإذن + الحصول على token) ----------
+        async function subscribeAndSendToken() {
+            try {
+                const perm = await Notification.requestPermission();
+                if (perm !== 'granted') {
+                    notifStatus.textContent = 'تم رفض إذن التنبيهات. يمكنك السماح لاحقاً من إعدادات المتصفح.';
+                    return;
+                }
+
+                const token = await messaging.getToken({ vapidKey });
+                console.log('FCM Token:', token);
+                notifStatus.textContent = 'التنبيهات مفعلة ✓';
+                enableBtn.style.display = 'none';
+
+                // إرسال الـ token إلى خادمك مرة واحدة فقط (نحفظه محلياً حتى لا نكرر الإرسال)
+                let stored = '';
+                try { stored = localStorage.getItem('fcm_token') || ''; } catch (e) {}
+                if (token !== stored) {
+                    try { localStorage.setItem('fcm_token', token); } catch (e) {}
+                    if (TOKEN_ENDPOINT && TOKEN_ENDPOINT.startsWith('http')) {
+                        await fetch(TOKEN_ENDPOINT, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ token })
+                        }).catch(e => console.error('رقم الـ token لم يُحفظ:', e));
+                    }
+                }
+            } catch (err) {
+                console.error('خطأ في الاشتراك:', err);
+                notifStatus.textContent = 'حدث خطأ في تفعيل التنبيهات. تأكد من فتح الموقع عبر HTTPS.';
+            }
+        }
+
+        // ---------- التفعيل التلقائي عند فتح الموقع ----------
+        let autoStarted = false;
+        async function tryAutoEnable() {
+            if (autoStarted) return;
+            autoStarted = true;
+
+            // آيفون: يجب إضافة الموقع للشاشة الرئيسية أولاً
+            if (isIOS() && !isStandalone()) {
+                enableBtn.style.display = 'none';
+                notifStatus.textContent = 'على آيفون: اضغط زر المشاركة ثم "إضافة إلى الشاشة الرئيسية"، ثم افتح التطبيق من الشاشة الرئيسية.';
+                return;
+            }
+
+            // المتصفحات المدمجة داخل تطبيقات لا تدعم الإشعارات
+            if (isInAppBrowser() || isAndroidWebView()) {
+                enableBtn.style.display = 'none';
+                notifStatus.textContent = 'افتح الموقع في متصفحك (Chrome أو Safari) لتفعيل التلقائي للتنبيهات.';
+                return;
+            }
+
+            if (!('Notification' in window)) {
+                enableBtn.style.display = 'none';
+                notifStatus.textContent = 'متصفحك لا يدعم الإشعارات.';
+                return;
+            }
+
+            // تسجيل الـ Service Worker (يُسمح به دائماً حتى بدون إذن)
             if ('serviceWorker' in navigator) {
                 try {
                     await navigator.serviceWorker.register('./firebase-messaging-sw.js');
@@ -235,59 +293,32 @@
                 }
             }
 
-            if (!('Notification' in window)) {
-                notifStatus.textContent = 'متصفحك لا يدعم الإشعارات.';
+            // المستخدم سمح مسبقاً -> فعّل فوراً عند الفتح بلا أي نقرة
+            if (Notification.permission === 'granted') {
+                await subscribeAndSendToken();
                 return;
             }
 
-            // آيفون: يجب إضافة الموقع للشاشة الرئيسية أولاً (زر المشاركة)
-            if (isIOS() && !isStandalone()) {
-                notifStatus.textContent = 'على آيفون: اضغط زر المشاركة ثم "إضافة إلى الشاشة الرئيسية"، ثم افتح التطبيق من الشاشة الرئيسية وأعد المحاولة.';
+            // المستخدم رفض -> لا نستطيع طلب مجدداً
+            if (Notification.permission === 'denied') {
+                enableBtn.style.display = 'none';
+                notifStatus.textContent = 'التنبيهات معطلة في متصفحك. فعّلها من إعدادات الموقع.';
                 return;
             }
 
-            // متصفحات مدمجة داخل تطبيقات (فيسبوك/تليغرام/واتساب) لا تدعم الإشعارات
-            if (isInAppBrowser() || isAndroidWebView()) {
-                notifStatus.textContent = 'افتح الموقع في متصفحك (Chrome أو Safari) لتفعيل التنبيهات.';
-                return;
-            }
-
-            try {
-                const perm = await Notification.requestPermission();
-                if (perm !== 'granted') {
-                    notifStatus.textContent = 'تم رفض الإذن. فعّل الإشعارات من إعدادات الموقع في متصفحك ثم أعد المحاولة.';
-                    return;
-                }
-
-                // الحصول على الـ Token الفريد لهذا المتصفح
-                const token = await messaging.getToken({ vapidKey });
-                console.log('FCM Token:', token);
-                notifStatus.textContent = 'تم تفعيل التنبيهات ✓';
-
-                // إرسال الـ Token إلى خادمك لتخزينه وإرسال الإشعارات لاحقاً
-                if (TOKEN_ENDPOINT && TOKEN_ENDPOINT.startsWith('http')) {
-                    await fetch(TOKEN_ENDPOINT, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ token })
-                    });
-                }
-            } catch (err) {
-                console.error('خطأ في تفعيل الإشعارات:', err);
-                notifStatus.textContent = 'حدث خطأ أثناء تفعيل الإشعارات. تأكد من فتح الموقع عبر HTTPS.';
-            }
+            // الإذن ما زال "لم يُقرر": المتصفحات تمنع الطلب إلا بعد تفاعل المستخدم.
+            // لذلك نفعّل تلقائياً مع أول نقرة/لمسة/ضغطة مفتاح في الصفحة.
+            notifStatus.textContent = 'اضغط في أي مكان لتفعيل التنبيهات تلقائياً';
+            const gestures = ['click', 'touchstart', 'keydown'];
+            const trigger = () => {
+                gestures.forEach((ev) => window.removeEventListener(ev, trigger));
+                subscribeAndSendToken();
+            };
+            gestures.forEach((ev) => window.addEventListener(ev, trigger, { passive: true }));
         }
 
-        // عند فتح الصفحة: ضبط الرسالة/الزر حسب نوع المتصفح
-        (function initNotifUI() {
-            if (isIOS() && !isStandalone()) {
-                enableBtn.style.display = 'none';
-                notifStatus.textContent = 'لتلقي التنبيهات على آيفون: افتح زر المشاركة، اختر "إضافة إلى الشاشة الرئيسية"، ثم افتح التطبيق من الشاشة الرئيسية واضغط تفعيل التنبيهات.';
-            } else if (isInAppBrowser() || isAndroidWebView()) {
-                enableBtn.style.display = 'none';
-                notifStatus.textContent = 'التنبيهات غير مدعومة داخل هذا التطبيق (فيسبوك/تليغرام/واتساب..). افتح الموقع في Chrome أو Safari.';
-            }
-        })();
+        // بدء التفعيل التلقائي عند فتح الصفحة
+        tryAutoEnable();
 
         // استقبال الإشعارات أثناء فتح الصفحة (في المقدمة)
         messaging.onMessage((payload) => {
